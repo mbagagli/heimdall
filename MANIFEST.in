@@ -1,0 +1,3 @@
+include README.md LICENSE
+recursive-include docs *.rst *.md
+recursive-include configs *.yml *.yaml *.json

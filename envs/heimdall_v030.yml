@@ -1,0 +1,35 @@
+name: heimdall
+channels:
+  - conda-forge
+  - pytorch           # PyTorch & audio/vision wheels
+  - nvidia            # CUDA meta-packages
+  - pyg
+
+dependencies:
+  # Core
+  - python>=3.11,<3.13
+  - pip                      # keep for PyPI one-offs
+  - pandas>=1.3              # direct deps start here
+  - numpy>=1.26
+  - scipy>=1.11
+  - matplotlib>=3.8
+  - matplotlib-inline>=0.1.6
+  - seaborn>=0.13
+  - obspy>=1.4
+  - scikit-learn>=1.3
+  - tqdm==4.66.1
+  - yaml>=0.2
+  - ipython
+
+
+  # Torch stack
+  - pytorch=2.1  # solver adds the right build tag
+  - torchvision=0.16
+  - torchaudio=2.1
+  - pytorch-cuda=12.1  # single line → whole CUDA run-time
+
+  # Graph-DL (PyG)
+  - pyg>=2.4           # meta-package pulls in torch-cluster/scatter/sparse
+
+  # (Optional) Dev / test tools
+  - pytest

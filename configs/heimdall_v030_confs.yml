@@ -1,0 +1,105 @@
+version: "0.3.0"
+
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+BUILD_GNN:
+  PROJ_START_DATE: "2018-12-01T00:00:00"
+  PROJ_END_DATE: "2021-01-31T00:00:00"
+  INVENTORY_PATH: "NetworksResponse_COSEISMIQ.xml"
+  NETWORKS: ["2C", "OR"]  # Network code selection of stations (if False or null, select ALL network codes)
+  PLOT_GRAPH_ARCH: True
+  BASE_CONNECT_TYPE: "KNN"
+  BASE_CONNECT_VALUE: 7  # degree
+  SELF_LOOPS: True
+  SCALE_DISTANCES: "max"   # Also NONE or FALSE or STD
+  GNN_TAG: "heimdall_graph"  # stored in the NPZ
+
+BUILD_GRID:
+  BOUNDARIES: [-21.57, -20.9,  # Make sure this limits contains the boundaries of SYNTHs making
+               63.91, 64.155,
+               0.0, 15.0]
+  SPACING_XYZ: [0.5, 0.5, 0.5]  # km
+  CENTRE: False
+  GRID_TAG: "heimdall_grid"  # stored in the NPZ
+
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+PREPARE_DATA:
+  DOWNSAMPLE:
+    new_df: 100.0
+    hp_freq: 2   # The bandpass filter will be applied from HP-FREQ to the antialias frequency
+
+  SOURCE_ERRORS_BY_PICKS:
+    # n.picks in window:  [radius, max background noise, source noise]
+    0:  [0.0, 0.0, 0.0]
+    1:  [0.0, 0.0, 0.0]
+    2:  [0.0, 0.0, 0.0]
+    3:  [8.0, 0.0, 0.0]
+    4:  [7.0, 0.0, 0.0]
+    5:  [6.0, 0.0, 0.0]
+    6:  [5.0, 0.0, 0.0]
+    7:  [4.0, 0.0, 0.0]
+    8:  [3.0, 0.0, 0.0]
+    9:  [2.0, 0.0, 0.0]
+    10: [1.0, 0.0, 0.0]
+    11: [0.7, 0.0, 0.0]
+    # higher number of picks in windows will keep the last key
+
+  SLICING:
+      wlen_seconds: 5.0
+      slide_seconds: 0.5
+
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+TRAINING_PARAMETERS:
+  # ----------  output
+  PLOTS:
+    make_plots:       True      # if False the code never calls gplt
+    every_batches:    50        # produce a figure every N batches
+
+  # ----------  data sampling & augmentations
+  DATASET:
+    how_many:         null      # null == use all events
+    evenize:                    # arguments passed to __evenize_classes__
+      min_pick_signal:  1
+      reduce_data:      False
+      noise_perc:       0.10
+      signal_perc:      0.90
+
+  AUGMENTATION:
+    enabled:          True
+    batch_size_all:   8
+
+  RANDOM_SEED:        42
+
+  # ----------  splits
+  SPLIT:
+    test:             0.10
+    val:              0.10
+
+  # ----------  optimiser & scheduler
+  OPTIMISATION:
+    learning_rate:    1.0e-4
+    epochs:           null      # null --> use early stopping (next block)
+    early_stopping:
+      patience:       7
+      delta:          1.0e-4
+
+  # ----------  loss weighting
+  LOCATOR_LOSS:          # W1_XY, W2_XZ, W3_YZ
+    xy:   1.0
+    xz:   1.0
+    yz:   1.0
+
+  COMPOSITE_LOSS:        # ALPHA, BETA, GAMMA
+    alpha: 1.0
+    beta:  1.0
+    gamma: 1.0
+
+  # ----------  model initialisation
+  MODEL:
+    pretrained_weights: ""      # path or "" to train from scratch
+    freeze_encoder:    False    # keep False unless you've good reasons not to

@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heimdall-graph"
+version = "0.3.0"                  # bump with each release
+description = "a grapH based sEIsMic Detector and Locator"
+readme = "README.md"               # long description
+requires-python = ">=3.9"
+license = {file = "LICENSE"}       # or: license = {text = "MIT"}
+authors = [
+  {name = "Matteo Bagagli", email = "matteo.bagagli@dst.unipi.it"},
+  {name = "Francesco Grigoli", email = "francesco.grigoli@unipi.it"},
+  {name = "Davide Bacciu", email = "davide.bacciu@unipi.it"}
+]
+
+# Runtime deps – just examples:
+dependencies = [
+  "requests>=2.32",
+  "pydantic>=2.8"
+]
+
+## Optional groups:
+#[project.optional-dependencies]
+#dev   = ["ruff", "pytest", "pytest-cov"]
+#docs  = ["sphinx", "furo"]
+
+## Console-entry points (if you have a CLI script inside heimdall/cli.py)
+#[project.scripts]
+#heimdall = "heimdall.cli:main"
+
+## --- setuptools-specific tweaks ---
+#[tool.setuptools]
+#packages = ["find:"]
+
+#[tool.setuptools.package-data]
+## Include non-Python data you want shipped inside the wheel
+#"heimdall" = ["py.typed", "data/**/*.json"]
+
+## Include files that live *outside* the package (e.g. configs/)
+#[tool.setuptools.exclude-package-data]
+#"*": ["*.py[cod]", "__pycache__/*"]
+
+## If you need package-wide type hints (PEP 561):
+#[tool.setuptools.packages.find]
+#where = ["."]
