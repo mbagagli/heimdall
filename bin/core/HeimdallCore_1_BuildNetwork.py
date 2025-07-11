@@ -22,16 +22,17 @@ from obspy import UTCDateTime as UTC
 #
 import torch
 #
-import mycode
-from mycode import io as gio
-from mycode import graph as gnn
-from mycode import plot as gpl
-from mycode import custom_logger as CL
+import heimdall
+from heimdall import io as gio
+from heimdall import graph as gnn
+from heimdall import plot as gpl
+from heimdall import custom_logger as CL
 #
 from pathlib import Path
 
 
-logger = CL.init_logger(Path(sys.argv[0]).name, lvl="INFO")
+logger = CL.init_logger(Path(sys.argv[0]).name, lvl="INFO",
+                        log_file="BuildNetwork.log")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
@@ -87,9 +88,9 @@ def build_heimdall_gnn(confs):
                 NODES, EDGES,
                 clusters=clusters,
                 fig_title="Graph Network\n%s / %s" % (_start_title, _end_title),
-                store=True,
-                store_name="./Heimdall_GNN__%s_%s__.pdf" % (
+                store="./Heimdall_GNN__%s_%s__.pdf" % (
                                 _start_title, _end_title),
+                limits=confs.PLOT_BOUNDARIES,
                 show=True)
 
     # 3. ---------------------------------------  Store
@@ -104,12 +105,13 @@ def build_heimdall_gnn(confs):
              stations_order=stations_dict,
              stations_coordinate=stations_coord_dict,
              tag=confs.GNN_TAG,
-             version=mycode.__version__)
+             version=heimdall.__version__)
 
     with open("node_station_map_unordered.txt", "w") as OUT:
+        OUT.write("#LON LAT ELE_mt NAME NET\n")
         for _net in inv:
             for _sta in _net:
-                OUT.write("%f  %f  %.2f %6s  %2s\n" % (
+                OUT.write("%f  %f  %8.2f  %6s  %2s\n" % (
                         _sta.longitude, _sta.latitude, _sta.elevation,
                         _sta.code, _net.code
                     ))

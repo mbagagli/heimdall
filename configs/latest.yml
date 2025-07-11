@@ -1,0 +1,136 @@
+version: "0.3.0"
+
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+BUILD_GNN:
+  PROJ_START_DATE: "2000-01-01T00:00:00"
+  PROJ_END_DATE: "2050-12-31T23:59:59"
+  INVENTORY_PATH: "Inventory_training_data.xml"
+  NETWORKS: ["OR", "2C" ]  # Network code selection of stations (if False or null, select ALL network codes)
+  PLOT_GRAPH_ARCH: True
+  BASE_CONNECT_TYPE: "KNN"
+  BASE_CONNECT_VALUE: 7  # degree
+  SELF_LOOPS: True
+  SCALE_DISTANCES: "max"   # Also NONE or FALSE or STD
+  GNN_TAG: "heimdall_graph"  # stored inside the NPZ
+  PLOT_BOUNDARIES: []
+
+BUILD_GRID:
+  BOUNDARIES: [130.3, 131.8,
+               32.55, 33.5,
+               0.0, 25.0]       # km
+  SPACING_XYZ: [0.25, 0.25, 0.1]  # km
+  CENTRE: False
+  GRID_TAG: "heimdall_grid"  # stored in the NPZ
+
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+PREPARE_DATA:
+  DOWNSAMPLE:
+    new_df: 100.0
+    hp_freq: 2   # The bandpass filter will be applied from HP-FREQ to the antialias frequency ALWAYS
+
+  SOURCE_ERRORS_BY_PICKS:
+    # n.picks in window:  [radius (km), max background noise, source noise]
+    0:  [0.0, 0.0, 0.0]
+    1:  [0.0, 0.0, 0.0]
+    2:  [0.0, 0.0, 0.0]
+    3:  [7.0, 0.0, 0.0]
+    4:  [6.0, 0.0, 0.0]
+    5:  [5.0, 0.0, 0.0]
+    6:  [4.0, 0.0, 0.0]
+    7:  [3.0, 0.0, 0.0]
+    8:  [2.0, 0.0, 0.0]
+    9:  [1.0, 0.0, 0.0]
+    10: [0.7, 0.0, 0.0]
+    11: [0.5, 0.0, 0.0]
+    # higher number of picks in windows will keep the last key
+
+  SLICING:
+      wlen_seconds: 5.0
+      slide_seconds: 0.5
+
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+TRAINING_PARAMETERS:
+  # ----------  output
+  PLOTS:
+    make_plots:       True      # if False the code never calls gplt
+    every_batches:    50        # produce a figure every N batches
+
+  # ----------  data sampling & augmentations
+  DATASET:
+    how_many:         null      # null == use all events
+    evenize:                    # arguments passed to __evenize_classes__
+      min_pick_signal:  1
+      reduce_data:      False
+      noise_perc:       0.10
+      signal_perc:      0.90
+    batch_size: 8
+    n_work: 5
+
+  AUGMENTATION:
+    enabled:          True
+
+  RANDOM_SEED:        42
+
+  # ----------  splits
+  SPLIT:
+    test:             0.10
+    val:              0.10
+
+  # ----------  optimiser & scheduler
+  OPTIMISATION:
+    learning_rate:    1.e-4
+    epochs:           null      # null --> use early stopping (next block)
+    early_stopping:
+      patience:       7
+      delta:          1.e-4
+
+  # ----------  loss weighting
+  LOCATOR_LOSS:          # W1_XY, W2_XZ, W3_YZ
+    xy:   1.0
+    xz:   1.0
+    yz:   1.0
+
+  COMPOSITE_LOSS:        # ALPHA, BETA, GAMMA
+    alpha: 1.0
+    beta:  1.0
+    gamma: 1.0
+
+  # ----------  model initialisation
+  MODEL:
+    pretrained_weights: ""      # path to previously trained model (i.e. transfer learning or fine tuning of the heads) or "" to train from scratch
+    freeze_encoder:    False    # keep it False unless you've good reasons not to ...
+
+
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+PRODUCTION:
+  DATA:
+    Slicing:
+      wlen_seconds: 5.0
+      slide_seconds: 0.5
+    ChunkSize: 86400  # MSEED Stream chunking sizes
+    PreProcess:
+      new_df: 100.0
+      hp_freq: 2
+
+  MODEL:
+    weights_path: "models/HEIMDALL.refined.pt"  # <- used unless CLI -w
+    batch_size: 8                               # <- used unless CLI --batch-size
+
+  CLASSIFIER:
+    thr_prob:        0.05
+    thr_coherence:   4000.0
+    thr_sta_obs_mag: 0.2
+    buffer_signal:         5
+    buffer_noise:          0
+
+  MAGNITUDE:
+    response_xml: "NetworksResponse_COSEISMIQ.xml"
+    reference_amplitudes: "M1.99_REFERENCE.npz"

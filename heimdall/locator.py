@@ -404,6 +404,13 @@ class HeimdallLocator(object):
 
         return (label_pdf, (eqlon_ongrid, eqlat_ongrid, eqdep))
 
+    def map_on_grid(self, source_coord):
+        eqlon, eqlat, eqdep = source_coord
+        #
+        [(eqlon_ongrid, eqlat_ongrid, _), ] = self.grid.convert_geo_list(
+                                              [(eqlat, eqlon),])
+        return (eqlon_ongrid, eqlat_ongrid, eqdep)
+
     def create_source_images(
                     self, source_coord, std_err_km=1.5, noise_max=None,
                     source_noise=None, dep_in_km=True, stations_coordinates=None,

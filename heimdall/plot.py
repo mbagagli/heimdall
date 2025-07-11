@@ -126,7 +126,7 @@ def plot_sources(sources_xyzsdrm, stations_xyz, show=False):
 
 
 def plot_graph(nodes, edges, clusters=None, fig_title="Graph Network",
-               show=False, store=False, names={}, store_name="GNN.pdf"):
+               show=False, store="GNN.pdf", names={}, limits=[]):
     """
     Plots a graph with nodes and edges, optionally displaying cluster information,
     and can save the figure to a file.
@@ -145,23 +145,15 @@ def plot_graph(nodes, edges, clusters=None, fig_title="Graph Network",
             all nodes are considered as part of a single cluster. Defaults to None.
         fig_title (str, optional): Title of the graph. Defaults to "Graph Network".
         show (bool, optional): If True, display the plot immediately. Defaults to False.
-        store (bool, optional): If True, save the plot to a file. Defaults to False.
+        store (str, optional): If True, save the plot to a file. Defaults to 'GNN.pdf'.
         names (dict, optional): A dictionary where keys are node labels and values
             are indices in the `nodes` array. Defaults to {}.
-        store_name (str, optional): The filename where the figure should be saved if
-            `store` is True. Defaults to "GNN.pdf".
+        limits (List/Tuple, optional): A list of list/tuple containing
+            [[lon_min, lon_max], [lat_min, lat_max]]
 
     Returns:
         matplotlib.figure.Figure: The figure object containing the graph plot.
     """
-
-    # All ICELAND
-    lat_range = [63, 67]
-    lon_range = [-25, -13]
-
-    # Investigation AREA
-    lat_range = [63.8, 64.25]
-    lon_range = [-22, -20.7]
 
     X = nodes[:, 0:2]
     fig = plt.figure(figsize=(8, 5))  # Adjust the figure size as needed
@@ -200,14 +192,15 @@ def plot_graph(nodes, edges, clusters=None, fig_title="Graph Network",
     plt.title(fig_title)
     plt.xlabel('longitude')
     plt.ylabel('latitude')
-    plt.xlim(lon_range)
-    plt.ylim(lat_range)
+    if limits:
+        plt.xlim(limits[0])
+        plt.ylim(limits[1])
     plt.legend()
 
     # --- Closing
     plt.tight_layout()
     if store:
-        fig.savefig(store_name)
+        fig.savefig(store, dpi=300, bbox_inches="tight")
     if show:
         plt.show()
     #

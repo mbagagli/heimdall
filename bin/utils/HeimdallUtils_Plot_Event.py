@@ -33,11 +33,11 @@ plt.rcParams.update({
 
 def parse_cli():
     parser = argparse.ArgumentParser(
-        description="Plot Heimdall detection results and export MSEED."
+        description="Plot Heimdall NPZ and export MSEED."
     )
 
     parser.add_argument(
-        "-gnn", "-g",
+        "-g", "--graph",
         dest="gnn",
         type=str,
         required=True,
@@ -46,7 +46,7 @@ def parse_cli():
     )
 
     parser.add_argument(
-        "-event", "-e",
+        "-e", "--event",
         dest="event",
         type=str,
         required=True,
@@ -55,7 +55,7 @@ def parse_cli():
     )
 
     parser.add_argument(
-        "-overlap", "-o",
+        "-o", "--overlap",
         dest="overlap",
         type=float,
         default=4.5,
@@ -64,7 +64,7 @@ def parse_cli():
     )
 
     parser.add_argument(
-        "-df", "-s",
+        "-s", "--sampling-rate",
         dest="df",
         type=float,
         default=100.0,

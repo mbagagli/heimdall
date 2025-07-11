@@ -11,13 +11,15 @@ It will store a *npz file named: `heim_grid.npz` containing the following:
 
 import sys
 import numpy as np
-import mycode
-from mycode import io as gio
-from mycode import custom_logger as CL
+import heimdall
+from heimdall import io as gio
+from heimdall import locator as glctr
+from heimdall import custom_logger as CL
 #
 from pathlib import Path
 
-logger = CL.init_logger(Path(sys.argv[0]).name, lvl="INFO")
+logger = CL.init_logger(Path(sys.argv[0]).name, lvl="INFO",
+                        log_file="BuildGrid.log")
 
 # :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 # :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
@@ -50,7 +52,18 @@ def build_heimdall_grid(confs):
              spacing_km=confs.SPACING_XYZ,
              reference_point=reference_point,
              tag=confs.GRID_TAG,
-             version=mycode.__version__)
+             version=heimdall.__version__)
+
+    # ---------- 1. Initialize  LOCATOR
+    HG = glctr.HeimdallLocator(boundaries,
+                               spacing_x=confs.SPACING_XYZ[0],
+                               spacing_y=confs.SPACING_XYZ[1],
+                               spacing_z=confs.SPACING_XYZ[2],
+                               reference_point_lonlat=reference_point)
+    (xgr, ygr, zgr) = HG.get_grid()
+    (reflon, reflat) = HG.get_grid_reference()
+    SHAPES = [(len(xgr), len(ygr)), (len(xgr), len(zgr)), (len(ygr), len(zgr))]
+    logger.state("The 2D planes sizes (XY, XZ, YZ):  %r" % SHAPES)
 
 
 if __name__ == "__main__":

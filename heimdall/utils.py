@@ -7,7 +7,6 @@ Content
         * `downsampling_stream`
         * `recursive_stalta`
         * `recursive_stalta_gpu`
-        * `envelope_from_wavelet`
 
     Array conversion helpers
         * `__numpy_array_to_pytorch_tensor__`
@@ -29,8 +28,8 @@ import sys
 import pickle
 import torch
 import numpy as np
-import scipy
-import pywt
+# import scipy
+# import pywt
 #
 from pathlib import Path
 from heimdall import custom_logger as CL
@@ -161,50 +160,111 @@ def __pytorch_array_to_numpy__(ptarr, dtype="float64", clone=False):
 # =======================================================  TIME-PROC
 # ===================================================================
 
+# def downsampling_trace(
+#                  tr, new_df,
+#                  hp_freq=2.0,
+#                  taper=True,
+#                  copy=False):
+#     """Band-limit and resample a single ObsPy trace.
+
+#     Args:
+#         tr (obspy.core.trace.Trace): Input trace.
+#         new_df (float): Target sampling rate (samples per second).
+#         hp_freq (float, optional): High-pass corner frequency before
+#             resampling.  Default 2.0 Hz.
+#         taper (bool, optional): Apply a 0.5 % Hann taper before filtering.
+#             Default ``True``.
+#         copy (bool, optional): Operate on a deep copy of *tr*.
+#             Default ``False``.
+
+#     Returns:
+#         obspy.core.trace.Trace: The processed trace (original or copy).
+#     """
+#     if copy:
+#         work_tr = tr.copy()
+#     else:
+#         work_tr = tr
+
+#     # --- Check Nyquist
+#     cur_df  = work_tr.stats.sampling_rate
+#     # Will we actually have to resample?
+#     do_resample = new_df < cur_df - 1e-6          # 1 µHz tolerance
+#     nyq = (new_df if do_resample else cur_df) / 2.0
+#     if nyq <= hp_freq:
+#         raise ValueError(
+#             f"hp_freq ({hp_freq} Hz) must be below Nyquist ({nyq} Hz)"
+#         )
+
+#     # --- BandPass
+#     if taper:
+#         work_tr.taper(0.005, type='hann')
+#     #
+#     work_tr.filter(
+#                 "bandpass",
+#                 freqmin=hp_freq,
+#                 freqmax=nyq,
+#                 corners=2,
+#                 zerophase=True)
+
+#     # --- Downsample
+#     if do_resample:
+#         work_tr.resample(
+#             sampling_rate=new_df,
+#             window="hann",
+#             no_filter=False,  # MB: leave this on False! somehow is supernecessary
+#             strict_length=False)
+#     else:
+#         logger.state("Trace %s.%s.%s.%s has already samplingrate equal or less than %.1f" % (
+#                      work_tr.stats.network,
+#                      work_tr.stats.station, "",
+#                      work_tr.stats.channel, new_df))
+#     return work_tr
+
+
 def downsampling_trace(
-                 tr, new_df,
-                 hp_freq=2.0,
-                 taper=True,
-                 copy=False):
-    """Band-limit and resample a single ObsPy trace.
+    tr,
+    new_df: float,
+    hp_freq: float = 2.0,
+    taper: bool = True,
+    copy: bool = False,
+):
+    """High-pass at *hp_freq* and, if needed, resample to *new_df* Hz."""
+    work_tr = tr.copy() if copy else tr
+    cur_df  = work_tr.stats.sampling_rate
 
-    Args:
-        tr (obspy.core.trace.Trace): Input trace.
-        new_df (float): Target sampling rate (samples per second).
-        hp_freq (float, optional): High-pass corner frequency before
-            resampling.  Default 2.0 Hz.
-        taper (bool, optional): Apply a 0.5 % Hann taper before filtering.
-            Default ``True``.
-        copy (bool, optional): Operate on a deep copy of *tr*.
-            Default ``False``.
+    do_resample = new_df < cur_df - 1e-6          # 1 µHz tolerance
 
-    Returns:
-        obspy.core.trace.Trace: The processed trace (original or copy).
-    """
-    aaff = new_df / 2.0
-    if copy:
-        work_tr = tr.copy()
-    else:
-        work_tr = tr
-
-    # --- BandPass
+    # --- high-pass (always)
     if taper:
-        work_tr.taper(0.005, type='hann')
-    #
+        work_tr.taper(0.005, type="hann")
     work_tr.filter(
-                "bandpass",
-                freqmax=aaff,
-                freqmin=hp_freq,
-                corners=2,
-                zerophase=True)
+        "highpass",
+        freq=hp_freq,
+        corners=2,
+        zerophase=True,
+    )
 
-    # --- Downsample
-    work_tr.resample(
-        sampling_rate=new_df,
-        window="hann",
-        no_filter=False,  # MB: leave this on! somehow is supernecessary
-        strict_length=False)
-
+    # --- optional resample (using ObsPy built-in low-pass)
+    if do_resample:
+        nyq_new     = new_df / 2.0
+        if nyq_new <= hp_freq:
+            raise ValueError(
+                f"hp_freq ({hp_freq} Hz) must be below new Nyquist ({nyq_new} Hz)"
+            )
+        work_tr.resample(
+            sampling_rate=new_df,
+            window="hann",
+            no_filter=False,       # keep the anti-alias guard
+            strict_length=False,
+        )
+    else:
+        logger.debug(
+            "Trace %s.%s.%s already less or equal to %.1f Hz",
+            work_tr.stats.network,
+            work_tr.stats.station,
+            work_tr.stats.channel,
+            new_df,
+        )
     return work_tr
 
 
@@ -231,16 +291,10 @@ def downsampling_stream(
         work_st = st
     #
     for _tr in tqdm(work_st):
-        if _tr.stats.sampling_rate > new_df:
-            _tr = downsampling_trace(
-                             _tr, new_df,
-                             hp_freq=hp_freq,
-                             copy=False)
-        else:
-            logger.debug("Trace %s.%s.%s.%s has already samplingrate less than %.1f" % (
-                         _tr.stats.network, _tr.stats.station, "", _tr.stats.channel, new_df))
-            continue
-    #
+        _tr = downsampling_trace(
+                         _tr, new_df,
+                         hp_freq=hp_freq,
+                         copy=False)
     return work_st
 
 
@@ -375,42 +429,42 @@ def recursive_stalta_gpu(obs_data, dt, tshort, tlong, norm=False):
     return stalta
 
 
-def envelope_from_wavelet(signal, wavelet='db4', level=4,
-                          use_coeffs=[0, 1], boxcox=False):
-    """Compute a wavelet-based signal envelope.
+# def envelope_from_wavelet(signal, wavelet='db4', level=4,
+#                           use_coeffs=[0, 1], boxcox=False):
+#     """Compute a wavelet-based signal envelope.
 
-    Args:
-        signal (np.ndarray): Input 1-D signal.
-        wavelet (str, optional): PyWavelets wavelet name.  Default ``"db4"``.
-        level (int, optional): Maximum decomposition level.  Default ``4``.
-        use_coeffs (Sequence[int], optional): Indices of the wavelet
-            coefficients to keep when reconstructing the envelope
-            (0 = approximation, 1 = first detail, etc.).  Default ``(0, 1)``.
-        boxcox (bool, optional): Apply Box-Cox transform to the envelope.
-            Default ``False``.
+#     Args:
+#         signal (np.ndarray): Input 1-D signal.
+#         wavelet (str, optional): PyWavelets wavelet name.  Default ``"db4"``.
+#         level (int, optional): Maximum decomposition level.  Default ``4``.
+#         use_coeffs (Sequence[int], optional): Indices of the wavelet
+#             coefficients to keep when reconstructing the envelope
+#             (0 = approximation, 1 = first detail, etc.).  Default ``(0, 1)``.
+#         boxcox (bool, optional): Apply Box-Cox transform to the envelope.
+#             Default ``False``.
 
-    Returns:
-        np.ndarray: Positive envelope, length equal to *signal*.
-    """
-    # Boundary handling mode (e.g., 'symmetric', 'smooth', 'constant')
-    coeffs = pywt.wavedec(signal, wavelet, level=level, mode='symmetric')
+#     Returns:
+#         np.ndarray: Positive envelope, length equal to *signal*.
+#     """
+#     # Boundary handling mode (e.g., 'symmetric', 'smooth', 'constant')
+#     coeffs = pywt.wavedec(signal, wavelet, level=level, mode='symmetric')
 
-    # Initialize an empty list for the coefficients to be used in reconstruction
-    selected_coeffs = [None] * (level + 1)
+#     # Initialize an empty list for the coefficients to be used in reconstruction
+#     selected_coeffs = [None] * (level + 1)
 
-    # Select the approximation and detail coefficients based on the indices provided
-    for idx in use_coeffs:
-        selected_coeffs[idx] = coeffs[idx]
+#     # Select the approximation and detail coefficients based on the indices provided
+#     for idx in use_coeffs:
+#         selected_coeffs[idx] = coeffs[idx]
 
-    # Reconstruct the signal using the selected approximation and detail coefficients
-    envelope = pywt.waverec(selected_coeffs, wavelet)
+#     # Reconstruct the signal using the selected approximation and detail coefficients
+#     envelope = pywt.waverec(selected_coeffs, wavelet)
 
-    # Ensure the reconstructed envelope matches the original length
-    envelope = envelope[:len(signal)]
-    envelope[envelope <= 0.0] = np.finfo(float).eps
+#     # Ensure the reconstructed envelope matches the original length
+#     envelope = envelope[:len(signal)]
+#     envelope[envelope <= 0.0] = np.finfo(float).eps
 
-    if boxcox:
-        envelope, _ = scipy.stats.boxcox(envelope)
-        envelope[envelope <= 0.0] = np.finfo(float).eps
+#     if boxcox:
+#         envelope, _ = scipy.stats.boxcox(envelope)
+#         envelope[envelope <= 0.0] = np.finfo(float).eps
 
-    return envelope
+#     return envelope

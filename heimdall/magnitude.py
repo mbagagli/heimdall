@@ -10,7 +10,7 @@ Main class
 HeimdallMagnitude
     Loads an ObsPy inventory and, if available, a dictionary that maps
     each network.station code to a reference magnitude and reference
-    peak-to-peak amplitude.  Provides the :py:meth:`calculate_magnitude`
+    peak-to-peak amplitude.  Provides the `calculate_magnitude()`
     method to derive an event magnitude from multiple stations.
 
 Functions are embedded as private helpers inside the class.
@@ -50,7 +50,7 @@ class HeimdallMagnitude(object):
 
     * **Absolute** – Convert raw counts to ground motion using the
       station response (ObsPy ``Inventory``) and apply
-      :pyfunc:`obspy.signal.invsim.estimate_magnitude`.
+      `obspy.signal.invsim.estimate_magnitude()`.
 
     Parameters
     ----------

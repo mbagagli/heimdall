@@ -1,7 +1,7 @@
-# HEIMDALL
-
 ![heim_logo](logo/heim_logo_box_red.png)
+
 version: _0.3.0_
+
 authors: _Matteo Bagagli_, _Francesco Grigoli_, _Davide Bacciu_
 
 --------------------------------------------------------------
@@ -23,9 +23,9 @@ We offer an env.yml file for the installation (it may take a while).
 We recommend using `conda` for the installation:
 
 ```bash
-git clone PROJECTHTML
-cd HEIMDALL
-conda env create  -f env.yml
+git clone https://github.com/mbagagli/heimdall
+cd heimdall
+conda env create  -f envs/heimdall_v030.yml
 conda activate heimdall
 pip install .  # mind the dot
 ```

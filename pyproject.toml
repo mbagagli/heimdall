@@ -21,27 +21,14 @@ dependencies = [
   "pydantic>=2.8"
 ]
 
-## Optional groups:
-#[project.optional-dependencies]
-#dev   = ["ruff", "pytest", "pytest-cov"]
-#docs  = ["sphinx", "furo"]
-
-## Console-entry points (if you have a CLI script inside heimdall/cli.py)
-#[project.scripts]
-#heimdall = "heimdall.cli:main"
-
-## --- setuptools-specific tweaks ---
-#[tool.setuptools]
-#packages = ["find:"]
-
-#[tool.setuptools.package-data]
-## Include non-Python data you want shipped inside the wheel
-#"heimdall" = ["py.typed", "data/**/*.json"]
-
-## Include files that live *outside* the package (e.g. configs/)
-#[tool.setuptools.exclude-package-data]
-#"*": ["*.py[cod]", "__pycache__/*"]
-
-## If you need package-wide type hints (PEP 561):
-#[tool.setuptools.packages.find]
-#where = ["."]
+[project.optional-dependencies]
+# Everything needed to build the HTML docs locally, on CI,
+# and on Read the Docs.  Pin the same versions that worked in
+# your requirements-docs.txt “upgrade path”.
+docs = [
+  "sphinx>=8.2,<9",
+  "sphinx-rtd-theme>=3,<4",
+  "sphinx-autodoc-typehints",
+  "sphinx-autobuild",
+  "myst-parser",
+]

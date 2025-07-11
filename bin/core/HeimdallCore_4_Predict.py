@@ -63,78 +63,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 
-def _parse_cli():
-    """
-    Parse command-line arguments for the Heimdall pipeline.
-
-    Returns:
-        argparse.Namespace: Parsed command-line arguments.
-    """
-    p = argparse.ArgumentParser(
-        prog=Path(sys.argv[0]).name,
-        description="Run Heimdall on MSEED files.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-
-    # Core files / dirs -------------------------------------------------------
-    p.add_argument("-graph", "-g", metavar="GRAPH",
-                   help="Heimdall GNN graph file (.npz)")
-    p.add_argument("-grid", "-grd", metavar="GRID",
-                   help="Heimdall spatial grid file (.npz)")
-    p.add_argument("-conf", "-c", dest="config", metavar="YAML",
-                   help="Configuration YAML file")
-    p.add_argument("-weigths", "-w", dest="modweigths", metavar="MODEL",
-                   help="path to *.pt HEIMDALL model weights")
-    p.add_argument("-folders", "-f", dest="outfolder", metavar="DIR", nargs='+',
-                   help="One or more folder paths containing mseed files to process")
-    #
-    p.add_argument("--batch-size", type=int, default=8, help="Batch size for processing")
-    p.add_argument("--threshold-prob", type=float, default=0.05,
-                   help="Probability threshold for image-location (all planes max. value must exceed this value)")
-    p.add_argument("--threshold-coherence", type=float, default=4000.0,
-                   help="Coherence threshold for x,y,z dimensions (meters)")
-    p.add_argument("--threshold-sta-obs-mag", type=float, default=0.2,
-                   help="STA observation magnitude threshold")
-    p.add_argument("--buffer-signal", type=int, default=5,
-                   help="Number of signal buffer frames to trigger event recording")
-    p.add_argument("--buffer-noise", type=int, default=0,
-                   help="Number of noise buffer frames allowed")
-    p.add_argument("--stream-win-slide", type=int, default=3600*24,
-                   help="Stream window slide in seconds")
-    p.add_argument("--store-event-plot-data", action="store_true",
-                   help="Enable plot generation (default: False)")
-    return p
-
-
-def apply_cli_parameters(args):
-    """
-    Set global pipeline parameters from parsed command-line arguments.
-
-    Args:
-        args (argparse.Namespace): Parsed command-line arguments.
-
-    Returns:
-        bool: True if parameters successfully applied.
-    """
-    global BATCH_SIZE, HEIMDALL_WEIGHTS, MAKE_PLOTS
-    global THRESHOLD_PROB, THRESHOLD_COHERENCE, THRESHOLD_STA_OBS_MAG
-    global BUFF_SIG, BUFF_NOISE, STREAM_WIN_SLIDE
-
-    MAKE_PLOTS = args.store_event_plot_data
-    BATCH_SIZE = args.batch_size
-    THRESHOLD_PROB = args.threshold_prob
-    THRESHOLD_COHERENCE = args.threshold_coherence
-    THRESHOLD_STA_OBS_MAG = args.threshold_sta_obs_mag
-    BUFF_SIG = args.buffer_signal
-    BUFF_NOISE = args.buffer_noise
-    STREAM_WIN_SLIDE = args.stream_win_slide
-    HEIMDALL_WEIGHTS = args.modweigths
-    return True
-
-
-# @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-# @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-
 def AnalyticClassifier(pdf_xy, pdf_xz, pdf_yz,
                        grids_x, grids_y, grids_z,
                        pdf_threshold=0.1,
@@ -260,7 +188,7 @@ def __init_model_heimdall__(heim_weights, shapes, stations):
 # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 
 
-def __prepare_batches__(xin, edges, weights, batch_size=BATCH_SIZE):
+def __prepare_batches__(xin, edges, weights, batch_size=8):
     """
     Prepare PyTorch Geometric DataLoader batches from raw matrices.
 
@@ -303,7 +231,7 @@ def __prepare_batches__(xin, edges, weights, batch_size=BATCH_SIZE):
 
 def go_with_the_flow(X, edges, weights,
                      mod_heim,
-                     batch_size=BATCH_SIZE):
+                     batch_size=8):
     """
     Run detection and location inference pipeline on batch data.
 
@@ -430,9 +358,7 @@ def predict(heim_gnn, heim_grid, npz,
     # -------------------------------------------- 4. Collect Events
     # ------->     FINAL LOCATION / FINALERROR
     # For each window in verdict:
-    #   - scan for VERDICT >= 0.5 (signal),
-    #       - then extract max-value per plane
-    #       - append all of them into matrices
+    #   - scan for VERDICT with Analytic Classifier
     #       - do statistics on each plane to return the best records among thos
     #           and remove outliers
     #       - collect all triplets per plane (valid) and calculate the std deviation
@@ -1026,7 +952,7 @@ def __prepare_data_buffer__(inst, stat_dict_order, confs,
     return npz
 
 
-def main(args):
+def main(config):
     """
     Main driver function to run Heimdall detection pipeline on input data.
 
@@ -1039,15 +965,14 @@ def main(args):
     # =====================================================
     # ====================================  IMPORT VARS
 
-    heim_gnn = np.load(args.graph, allow_pickle=True)
+    heim_gnn = np.load(config.graph, allow_pickle=True)
     stats_coords = build_coord_matrix(heim_gnn["stations_coordinate"].item(),
                                       heim_gnn["stations_order"].item())  # (36,3)
     stats_coords_norm, stats = normalise_station_coords(stats_coords,
                                                         return_stats=True,
                                                         zero_one=False)
 
-    heim_grid = np.load(args.grid, allow_pickle=True)
-    CONFIG = gio.read_configuration_file(args.config, check_version=True)
+    heim_grid = np.load(config.grid, allow_pickle=True)
 
     # =====================================================
     # =================================  Initialize  MODEL
@@ -1061,11 +986,12 @@ def main(args):
     shapes = [(len(xgr), len(ygr)), (len(xgr), len(zgr)), (len(ygr), len(zgr))]
 
     logger.info(" Initializing MODELS")
-    Heimdall = __init_model_heimdall__(HEIMDALL_WEIGHTS, shapes, stats_coords_norm)
+    Heimdall = __init_model_heimdall__(
+                    config.MODEL.weights_path, shapes, stats_coords_norm)
 
     # =====================================================
     # ====================================  PREPARE DATA
-    for fold in args.folders:
+    for fold in args.inputs:
         st = __extract_folder__(fold)
 
         # ---> SLICE STREAM and create NPZ
@@ -1078,7 +1004,7 @@ def main(args):
             npzfile = __prepare_data_buffer__(
                             window,
                             heim_gnn["stations_order"].item(),
-                            CONFIG.PREPARE_DATA)
+                            config.DATA.PreProcess)
             store_dir = "%s_PREDS" % fold
 
             if not npzfile:
@@ -1190,21 +1116,56 @@ def normalise_station_coords(coord_mat, *,
     return coords
 
 
-# ================================================================
-# ================================================================
-# ================================================================
-# ================================================================
-# ================================================================
+# @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+# @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+def _parse_cli() -> argparse.Namespace:
+    cli = argparse.ArgumentParser(
+        prog=Path(sys.argv[0]).name,
+        description="Heimdall production runner",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    cli.add_argument("-g",  "--graph",  required=True,
+                     help="GNN graph .npz file")
+    cli.add_argument("-grd", "--grid",   required=True,
+                     help="3D grid .npz file")
+    cli.add_argument("-c",  "--config", required=True,
+                     help="YAML configuration file (PRODUCTION block)")
+    cli.add_argument("-i", "--inputs", nargs="+", required=True,
+                     help="mseed file(s) or folder(s)")
+    cli.add_argument("-w", "--weights", type=str,
+                     help="override MODEL.weights_path")
+    cli.add_argument("--batch-size", type=int,
+                     help="override MODEL.batch_size")
+
+    return cli
+
+
+def _resolve_config(args, cfg):
+    # Adjust PRODUCTION configuration cell
+    cfg['PRODUCTION']['graph'] = args.graph
+    cfg['PRODUCTION']['grid'] =  args.grid
+    cfg['PRODUCTION']['inputs'] = args.inputs
+    if args.weights:
+        logger.state("Overriding config's MODEL-WEIGHTS with CLI one: %s" % args.weights)
+        cfg.PRODUCTION.MODEL.weights_path = Path(args.weights).expanduser().resolve()
+    else:
+        logger.state("Using config's MODEL-WEIGHTS: %s" % cfg.PRODUCTION.MODEL.weights_path)
+    #
+    if args.batch_size:
+        logger.state("Overriding config's BATCH-SIZE with CLI one: %d" % args.batch_size)
+        cfg.PRODUCTION.MODEL.batch_size = args.batch_size
+    else:
+        logger.state("Using config's BATCH-SIZE: %s" % cfg.PRODUCTION.MODEL.batch_size)
+    return cfg
+
 
 if __name__ == "__main__":
     parser = _parse_cli()
-    if len(sys.argv) == 1 or sys.argv[1].lower() in ("-h", "--help"):
-        parser.print_help(sys.stdout)
-        sys.exit()
-    #
     args = parser.parse_args()
-    logger.info("PARSER INPUTS")
     for k, v in vars(args).items():
         logger.info(f"{k}: {v}")
+    cfg = gio.read_configuration_file(args.config, check_version=True)
     #
-    main(args)
+    CONFIG = _resolve_config(args, cfg)
+    main(CONFIG.PRODUCTION)

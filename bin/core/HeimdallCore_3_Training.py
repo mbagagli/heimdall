@@ -1,10 +1,62 @@
 #!/usr/bin/env python
 
 """
-End-to-end training script for HEIMDALL detector-locator
-(GNN-based).  It loads seismic datasets, applies optional data
-augmentation, trains the joint detector + locator network with early
-stopping, and finally evaluates on a hold-out set.
+End‑to‑end training script for HEIMDALL detector‑locator (GNN‑based)
+===============================================================================
+This script is the **last stage** of the Heimdall processing chain:
+1.  It loads pre‑computed
+    * a station **graph** describing spatial relationships between stations,
+    * a 3‑D **grid** where location probabilities are evaluated,
+    * an **HDF5 archive** containing input windows (detector char‑functions) and
+      associated labels / targets prepared by the *PrepareDataset* stage, and
+    * a YAML **configuration** file.
+2.  It instantiates the joint **detector+locator** neural network (defined in
+    `heimdall.models.HEIMDALL`), optionally loading pretrained weights or
+    freezing the encoder layers as requested in the YAML.
+3.  Using three `DataLoader`s (train / test / val) that **stream directly from
+    disk**, it trains the network with early‑stopping and a ReduceLROnPlateau
+    scheduler while keeping track of a wealth of metrics (loss histories,
+    per‑phase confusion matrices and F‑scores, locator losses per‑plane, etc.).
+4.  After training it evaluates on the hold‑out set and, **optionally**, plots
+    pretty diagnostic figures every _N_ batches.
+5.  All metrics are stored in `refining_training_metrics.npz` and the best model
+    weights are saved to `HEIMDALL.refined.pt`.
+
+Key design choices & implementation highlights
+---------------------------------------------
+* **Memory‑light dataset** – `HeimdallH5Dataset` opens the HDF5 file lazily in
+  each worker so that multiple subprocesses do not fight over the file handle.
+* **Evenising** – class imbalance (signal vs noise windows) is fixed *before*
+  touching the heavy waveforms by looking only at the `pick_count` vector.
+* **Augmentations** – cheap time‑series transforms (jitter, scaling, signed‑log,
+  inversion) are applied *on‑the‑fly* to **half** of every batch so that the
+  effective batch size doubles when `AUGMENTATION.enabled = True`.
+* **Composite loss** – the total loss is:
+  ```
+  L_total = ALPHA·L_detector  +  BETA·L_locator/3  +  GAMMA·L_coord
+             [from CF CNN]        [3 raster BCE]     [smooth‑L1 on XYZ coords]
+  ```
+  where the factors come from `COMPOSITE_LOSS` in the YAML.
+* **Early stopping** – if `OPTIMISATION.epochs` is `null`, training will proceed
+  indefinitely **until** the validation loss fails to improve by at least
+  `delta` for `patience` epochs.
+* **Heavy plotting** is *disabled* by default because it slows training down a
+  lot – flip `PLOTS.make_plots` if you really need it.
+
+The rest of the file is organised as follows (search for the headers):
+----------------------------------------------------------------------
+0.  **Imports and logging**
+1.  `__init_model__` - build model + optimiser
+2.  *Utility helpers* (evenising, augmentations, scaling)
+3.  `HeimdallH5Dataset` + streaming `DataLoader`s
+4.  A batch of metric helpers (precision/recall, pick matching, PDF→XYZ…)
+5.  `__training_flow_ALL__` - the actual training loop
+6.  Thin wrappers: `training_flow`, `validate_flow`, plotting helpers
+7.  CLI entry‑point `main()` + some geo/normalisation utilities
+
+All edits are **inline** below - look for blocks starting with
+`# - EXPL:` for additional explanations that were *not* present in the
+original source.
 """
 
 import sys
@@ -35,6 +87,14 @@ from pathlib import Path
 #
 from scipy.signal import find_peaks, peak_widths
 
+import argparse
+import h5py
+from torch.utils.data import Dataset  # <-- plain PyTorch (works with PyG collate)
+
+import os
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
+
 __log_name__ = "HeimdallTraining.log"
 logger = CL.init_logger(__log_name__, lvl="INFO", log_file=__log_name__)
 
@@ -42,60 +102,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-# @@@@@@@@@@@@@@@@@@@@@@@@@@@  SET GLOBALS  @@@@@@@@@@@@@@@@@@@@@@@@@
-# @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-
-def apply_training_parameters(tp):
-    """Utility for setting-up training global parameters
-
-    Args:
-        tp (AttributeDict): extract from configuration YAML file
-    """
-    global MAKE_PLOTS, EVERY, HOWMANY, DO_AUGMENTATIONS, BATCH_SIZE_ALL
-    global BATCH_SIZE, RND_SEED, EVENIZE_ALL, LEARNING_RATE
-    global NUM_EPOCHS, ES_PATIENCE_ALL, ES_DELTA_ALL
-    global TEST_SPLIT, VAL_SPLIT
-    global W1_XY, W2_XZ, W3_YZ, ALPHA, BETA, GAMMA
-    global MODEL_WEIGHTS, FREEZE_ENCODER
-
-    # ------ 1. plots / logging
-    MAKE_PLOTS = tp.PLOTS.make_plots
-    EVERY      = tp.PLOTS.every_batches
-
-    # ------ 2. data / augm.
-    HOWMANY          = tp.DATASET.how_many
-    EVENIZE_ALL      = dict(tp.DATASET.evenize)
-    RND_SEED         = tp.RANDOM_SEED
-    DO_AUGMENTATIONS = tp.AUGMENTATION.enabled
-    BATCH_SIZE_ALL   = tp.AUGMENTATION.batch_size_all
-    BATCH_SIZE       = BATCH_SIZE_ALL // 2 if DO_AUGMENTATIONS else BATCH_SIZE_ALL
-
-    # ------ 3. split & optimiser
-    TEST_SPLIT = tp.SPLIT.test
-    VAL_SPLIT  = tp.SPLIT.val
-    LEARNING_RATE   = tp.OPTIMISATION.learning_rate
-    NUM_EPOCHS      = tp.OPTIMISATION.epochs
-    ES_PATIENCE_ALL = tp.OPTIMISATION.early_stopping.patience
-    ES_DELTA_ALL    = tp.OPTIMISATION.early_stopping.delta
-
-    # ------ 4. loss weights & model init
-    W1_XY = tp.LOCATOR_LOSS.xy
-    W2_XZ = tp.LOCATOR_LOSS.xz
-    W3_YZ = tp.LOCATOR_LOSS.yz
-    ALPHA = tp.COMPOSITE_LOSS.alpha
-    BETA  = tp.COMPOSITE_LOSS.beta
-    GAMMA = tp.COMPOSITE_LOSS.gamma
-
-    MODEL_WEIGHTS  = tp.MODEL.pretrained_weights
-    FREEZE_ENCODER = tp.MODEL.freeze_encoder
-    return True
-
-
-# @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 # @@@@@@@@@@@@@@@@@@@@@@@@@@  MODELS  @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 
-def __init_model__(shapes, stations, freeze_encoder=FREEZE_ENCODER, weights=""):
+def __init_model__(shapes, stations, confs):
     """Build a Heimdall model instance and its Adam optimizer.
 
     Args:
@@ -114,6 +124,9 @@ def __init_model__(shapes, stations, freeze_encoder=FREEZE_ENCODER, weights=""):
         parameters with ``requires_grad=True``.
     """
 
+    freeze_encoder = confs.MODEL.freeze_encoder
+    weights = confs.MODEL.pretrained_weights
+
     stations = torch.as_tensor(stations, dtype=torch.float32)   # on CPU
     model = gmdl.HEIMDALL(stations_coords=stations,
                           location_output_sizes=shapes)
@@ -128,8 +141,11 @@ def __init_model__(shapes, stations, freeze_encoder=FREEZE_ENCODER, weights=""):
             param.requires_grad = False
 
     # Only optimize parameters that require gradients
-    _optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()),
-                                  lr=LEARNING_RATE)
+    _optimizer = torch.optim.Adam(
+                    filter(lambda p: p.requires_grad, model.parameters()),
+                    lr=confs.OPTIMISATION.learning_rate)
+    #
+    # model = torch.compile(model, mode="reduce-overhead")
     model.to(device)
     return (model, _optimizer)
 
@@ -386,7 +402,7 @@ class Augmentations(object):
         #     out = self.__time_warp__(out, warp_factor_range=(0.8, 1.2), time_dim=-1)
 
         # 2. Jitter
-        if "jw" in combo:
+        if "jt" in combo:
             noise = torch.randn_like(out) * jitter_sigma
             out = out + noise
 
@@ -421,272 +437,132 @@ class Augmentations(object):
 # ==========================================================================
 # ==========================================================================
 
-def __unpack_data_LOCATOR__(X):
-    """Split locator targets into three numpy arrays.
+# --------------------------------------------------------------------------- I/O
+def scale_minusone_one(t, dim=-1):
+    """Rescale tensor to [-1,1] along `dim` (same math used before)."""
+    min_v = t.min(dim=dim, keepdim=True).values
+    max_v = t.max(dim=dim, keepdim=True).values
+    return 2 * (t - min_v) / (max_v - min_v + 1e-8) - 1
 
-    Args:
-        X (list[np.ndarray]): Each element contains three 2-D planes
-            (XY, XZ, YZ).
+def scale_zero_one(mat, dimension=-1):
+    min_vals = torch.min(mat, dim=dimension, keepdim=True).values
+    max_vals = torch.max(mat, dim=dimension, keepdim=True).values
+    mat = (mat - min_vals) / (max_vals - min_vals + 1e-8)
+    return mat
 
-    Returns:
-        tuple[np.ndarray, np.ndarray, np.ndarray]: Arrays with shapes
-        ``(E, 304, 330)``, ``(E, 304, 151)``, ``(E, 330, 151)``.
+class HeimdallH5Dataset(Dataset):
     """
-    # Initialize empty lists to store the arrays
-    data1_list = []
-    data2_list = []
-    data3_list = []
+    Memory-light replacement for the former NumPy-in-RAM archive.
+    Each __getitem__ returns exactly one `torch_geometric.data.Data`
+    object, constructed on the fly from the HDF5 slice.
+    """
+    # def __init__(self, h5_path, indices, heim_gnn, augment=False):
+    #     self.h5 = h5py.File(h5_path, "r", swmr=True)      # read-only, thread-safe
 
-    # Iterate through each element in the first dimension of X
-    for i in range(X.shape[0]):
-        data1_list.append(X[i][0])  # (62, 67)
-        data2_list.append(X[i][1])  # (62, 31)
-        data3_list.append(X[i][2])  # (67, 31)
+    def __init__(self, h5_path, indices, heim_gnn, augment=False):
+        self.h5_path = h5_path          # keep only the path
+        self.h5 = None                  # will be opened in the worker
+        self.idx = np.asarray(indices, dtype=np.int64)
+        self.edges = torch.as_tensor(heim_gnn["edges"], dtype=torch.long)
+        self.eattr = torch.as_tensor(heim_gnn["weights"], dtype=torch.float32)
 
-    # Convert the lists to numpy arrays with the desired shape
-    data1 = np.array(data1_list)  # Shape will be (131379, 62, 67)
-    data2 = np.array(data2_list)  # Shape will be (131379, 62, 31)
-    data3 = np.array(data3_list)  # Shape will be (131379, 67, 31)
+    def __len__(self):
+        return len(self.idx)
 
-    return (data1, data2, data3)
+    def _lazy_open(self):
+        if self.h5 is None:             # first call inside *this* worker
+            self.h5 = h5py.File(self.h5_path, "r", swmr=True)
 
+    def __getitem__(self, i):
+        self._lazy_open()
+        j = int(self.idx[i])
 
-def __prepare_data_ALL__(data_det, label_det, data_loc,
-                         label1, label2, label3, reals, sources_xyz, heim_gnn,
-                         test_size=TEST_SPLIT, val_size=VAL_SPLIT,
-                         batch_size=32, rnd_seed=RND_SEED,
-                         adding_path=""):
-    """Create train/val/test DataLoaders and apply optional injection."""
+        # ---------- detector inputs / labels ---------------------------------
+        x_det = torch.from_numpy(self.h5["Xdet"][j]).float()      # (N,C,F)
+        y_det = torch.from_numpy(self.h5["Ydet"][j]).float()
 
-    assert len(data_det) == len(label_det) == len(data_loc) == len(label1) == len(label2) == len(label3) == len(sources_xyz) == len(reals), \
-        "All inputs must have the same length"
+        x_det = scale_minusone_one(x_det)                         # same scaling
 
-    # Generate indices
-    indices = np.arange(len(data_det))
+        # ---------- locator inputs & targets ---------------------------------
+        x_loc = x_det[:, :1, :]                                   # keep CF#0
+        yl1   = torch.from_numpy(self.h5["Yloc_XY"][j]).float().unsqueeze(0)
+        yl2   = torch.from_numpy(self.h5["Yloc_XZ"][j]).float().unsqueeze(0)
+        yl3   = torch.from_numpy(self.h5["Yloc_YZ"][j]).float().unsqueeze(0)
 
-    # First split: Train vs. Remaining (Test + Validation)
-    train_idx, remaining_idx = train_test_split(
-        indices, test_size=test_size + val_size, random_state=rnd_seed)
+        # ---------- misc tensors ---------------------------------------------
+        r      = torch.from_numpy(self.h5["R"][j]).float()
+        src_xyz = torch.from_numpy(self.h5["sources_grid"][j]).float().unsqueeze(0)
 
-    # Second split: Remaining (Test + Validation) into Test vs. Validation
-    test_idx, val_idx = train_test_split(
-        remaining_idx, test_size=test_size / (test_size + val_size),
+        return Data(
+            x=x_det,
+            yd=y_det,
+            xl=x_loc,
+            yl1=yl1, yl2=yl2, yl3=yl3,
+            r=r, sources_xyz=src_xyz,
+            edge_index=self.edges,
+            edge_attr=self.eattr,
+            num_nodes=x_det.shape[0]
+        )
+
+def prepare_h5_loaders(h5_path, heim_gnn, confs):
+    """
+    Light-memory splitter that works directly on the HDF5 file.
+
+    `evenize_params` is applied by
+    loading **only the 1-D `pick_count` dataset** once, computing the
+    balanced indices, and never touching the heavy waveforms.
+    """
+
+    batch_size = confs.DATASET.batch_size
+    evenize_params = confs.DATASET.evenize
+    test_split = confs.SPLIT.test
+    val_split = confs.SPLIT.val
+    rnd_seed = confs.RANDOM_SEED
+    augment = confs.AUGMENTATION.enabled
+
+    with h5py.File(h5_path, "r") as h5:
+        pick_count = h5["pick_count"][:]                        # small (≤ int32)
+        all_idx    = np.arange(len(pick_count))
+
+    if evenize_params:
+        all_idx = __evenize_classes__(pick_count, **evenize_params)
+
+    # train / test / val split (unchanged logic)
+    train_idx, rem_idx = train_test_split(
+        all_idx, test_size=test_split + val_split, random_state=rnd_seed)
+    test_idx,  val_idx = train_test_split(
+        rem_idx, test_size=test_split / (test_split + val_split),
         random_state=rnd_seed)
 
-    assert len(set(train_idx) & set(remaining_idx)) == 0, \
-           "Train and remaining indices must be disjoint"
-    assert len(set(test_idx) & set(val_idx)) == 0, \
-           "Test and validation indices must be disjoint"
+    ds_train = HeimdallH5Dataset(h5_path, train_idx, heim_gnn, augment=augment)
+    ds_test  = HeimdallH5Dataset(h5_path, test_idx,  heim_gnn, augment=False)
+    ds_val   = HeimdallH5Dataset(h5_path, val_idx,  heim_gnn, augment=False)
 
-    # Indexing instead of copying large arrays
-    (train_data_det, train_label_det, train_data_loc,
-     train_label1, train_label2, train_label3,
-     train_reals, train_sources_xyz) = (data_det[train_idx], label_det[train_idx],
-                                        data_loc[train_idx], label1[train_idx],
-                                        label2[train_idx], label3[train_idx],
-                                        reals[train_idx], sources_xyz[train_idx])
-
-    (test_data_det, test_label_det, test_data_loc,
-     test_label1, test_label2, test_label3,
-     test_reals, test_sources_xyz) = (data_det[test_idx], label_det[test_idx],
-                                      data_loc[test_idx], label1[test_idx],
-                                      label2[test_idx], label3[test_idx],
-                                      reals[test_idx], sources_xyz[test_idx])
-
-    (val_data_det, val_label_det, val_data_loc,
-     val_label1, val_label2, val_label3,
-     val_reals, val_sources_xyz) = (data_det[val_idx], label_det[val_idx],
-                                    data_loc[val_idx], label1[val_idx],
-                                    label2[val_idx], label3[val_idx],
-                                    reals[val_idx], sources_xyz[val_idx])
-
-    if adding_path:
-        logger.warning("Adding training dataset injection !!! [%s]" % adding_path)
-        adding = np.load(adding_path, allow_pickle=True)
-        add_pick_count = adding["pick_count"]
-        add_data_det = adding["Xdet"].astype(np.float32)
-        add_labels_det = adding["Ydet"].astype(np.float32)
-        add_labels_loc = adding["Yloc"]  # convert to float32 later
-        add_reals = adding["R"].astype(np.float32)
-        add_sources_xyz = adding["sources_grid"].astype(np.float32)
-
-        add_data_loc = add_labels_det[:, :, :1, :]  # keep only the first channel for training
-        (_label1, _label2, _label3) = __unpack_data_LOCATOR__(add_labels_loc)
-        add_label1 = _label1.astype(np.float32)
-        add_label2 = _label2.astype(np.float32)
-        add_label3 = _label3.astype(np.float32)
-
-        train_data_det = np.concatenate(
-                        [train_data_det.astype(np.float32),
-                         add_data_det.astype(np.float32)], axis=0)
-        train_label_det = np.concatenate(
-                        [train_label_det.astype(np.float32),
-                         add_labels_det.astype(np.float32)], axis=0)
-        train_data_loc = np.concatenate(
-                        [train_data_loc.astype(np.float32),
-                         add_data_loc.astype(np.float32)], axis=0)
-        train_label1 = np.concatenate(
-                        [train_label1.astype(np.float32),
-                         add_label1.astype(np.float32)], axis=0)
-        train_label2 = np.concatenate(
-                        [train_label2.astype(np.float32),
-                         add_label2.astype(np.float32)], axis=0)
-        train_label3 = np.concatenate(
-                        [train_label3.astype(np.float32),
-                         add_label3.astype(np.float32)], axis=0)
-        train_reals = np.concatenate(
-                        [train_reals.astype(np.float32),
-                         add_reals.astype(np.float32)], axis=0)
-        train_sources_xyz = np.concatenate(
-                        [train_sources_xyz.astype(np.float32),
-                         add_sources_xyz.astype(np.float32)], axis=0)
-
-    # ==========================================
-
-    def __scale_zero_one(mat, dimension=-1):
-        min_vals = torch.min(mat, dim=dimension, keepdim=True).values
-        max_vals = torch.max(mat, dim=dimension, keepdim=True).values
-        mat = (mat - min_vals) / (max_vals - min_vals + 1e-8)
-        return mat
-
-    def __scale_minusone_one(mat, dimension=-1):
-        min_vals = torch.min(mat, dim=dimension, keepdim=True).values
-        max_vals = torch.max(mat, dim=dimension, keepdim=True).values
-        mat = 2 * (mat - min_vals) / (max_vals - min_vals + 1e-8) - 1
-        return mat
-
-    train_data_list = [
-            # shape: [N, C, T]
-            Data(
-                x=__scale_minusone_one(
-                    torch.tensor(train_data_det[idx], dtype=torch.float32)),
-                yd=torch.tensor(train_label_det[idx], dtype=torch.float32),
-                xl=torch.tensor(train_data_loc[idx], dtype=torch.float32),
-                yl1=torch.tensor(train_label1[idx], dtype=torch.float32).unsqueeze(0),
-                yl2=torch.tensor(train_label2[idx], dtype=torch.float32).unsqueeze(0),
-                yl3=torch.tensor(train_label3[idx], dtype=torch.float32).unsqueeze(0),
-                r=torch.tensor(train_reals[idx], dtype=torch.float32),
-                sources_xyz=torch.tensor(train_sources_xyz[idx], dtype=torch.float32).unsqueeze(0),
-                edge_index=torch.tensor(heim_gnn["edges"], dtype=torch.long),
-                edge_attr=torch.tensor(heim_gnn["weights"], dtype=torch.float32),
-                num_nodes=train_data_det[idx].shape[0]
-            )
-            for idx in range(train_data_det.shape[0])     # E = num events
-        ]
-    train_loader = DataLoader(
-                    train_data_list, batch_size=batch_size, shuffle=True)
-
-    test_data_list = [
-            Data(
-                x=__scale_minusone_one(
-                    torch.tensor(test_data_det[idx], dtype=torch.float32)),
-                yd=torch.tensor(test_label_det[idx], dtype=torch.float32),
-                xl=torch.tensor(test_data_loc[idx], dtype=torch.float32),
-                yl1=torch.tensor(test_label1[idx], dtype=torch.float32).unsqueeze(0),
-                yl2=torch.tensor(test_label2[idx], dtype=torch.float32).unsqueeze(0),
-                yl3=torch.tensor(test_label3[idx], dtype=torch.float32).unsqueeze(0),
-                r=torch.tensor(test_reals[idx], dtype=torch.float32),
-                sources_xyz=torch.tensor(test_sources_xyz[idx], dtype=torch.float32).unsqueeze(0),
-                edge_index=torch.tensor(heim_gnn["edges"], dtype=torch.long),
-                edge_attr=torch.tensor(heim_gnn["weights"], dtype=torch.float32),
-                num_nodes=test_data_det[idx].shape[0]
-            )
-            for idx in range(test_data_det.shape[0])     # E = num events
-        ]
-    test_loader = DataLoader(
-                    test_data_list, batch_size=batch_size, shuffle=False)
-
-    val_data_list = [
-            Data(
-                x=__scale_minusone_one(
-                    torch.tensor(val_data_det[idx], dtype=torch.float32)),                      # shape: [N, C, T]
-                yd=torch.tensor(val_label_det[idx], dtype=torch.float32),
-                xl=torch.tensor(val_data_loc[idx], dtype=torch.float32),
-                yl1=torch.tensor(val_label1[idx], dtype=torch.float32).unsqueeze(0),
-                yl2=torch.tensor(val_label2[idx], dtype=torch.float32).unsqueeze(0),
-                yl3=torch.tensor(val_label3[idx], dtype=torch.float32).unsqueeze(0),
-                r=torch.tensor(val_reals[idx], dtype=torch.float32),
-                sources_xyz=torch.tensor(val_sources_xyz[idx], dtype=torch.float32).unsqueeze(0),
-                edge_index=torch.tensor(heim_gnn["edges"], dtype=torch.long),
-                edge_attr=torch.tensor(heim_gnn["weights"], dtype=torch.float32),
-                num_nodes=val_data_det[idx].shape[0]
-            )
-            for idx in range(val_data_det.shape[0])     # E = num events
-        ]
-    val_loader = DataLoader(
-                    val_data_list, batch_size=BATCH_SIZE_ALL, shuffle=False)
-
-    return (train_loader, test_loader, val_loader)
-
-
-def prepare_ALL(npz, heim_gnn, how_many=None, evenize={}, adding_path=""):
-    """Load an ``.npz`` archive, balance classes, and create loaders.
-
-    Args:
-        npz (np.lib.npyio.NpzFile): Pre-saved training dataset.
-        heim_gnn (np.lib.npyio.NpzFile): GNN description (edges, etc.).
-        how_many (int | None, optional): If set, keep only the first
-            *how_many* events.
-        evenize (dict | None, optional): Parameters to pass to
-            :func:`__evenize_classes__`.
-        adding_path (str, optional): Additional ``.npz`` to inject.
-
-    Returns:
-        tuple[DataLoader, DataLoader, DataLoader]: Train, test, val loaders.
-    """
-    logger.info("Preparing DATA")
-
-    # =========================================================
-    pick_count = npz["pick_count"]
-    data_det = npz["Xdet"].astype(np.float32)
-    labels_det = npz["Ydet"].astype(np.float32)
-    labels_loc = npz["Yloc"]  # convert to float32 later
-    reals = npz["R"].astype(np.float32)
-    sources_xyz = npz["sources_grid"].astype(np.float32)
-
-    if evenize:
-        logger.info(" Evenizing classes")
-        selected_index = __evenize_classes__(
-            pick_count,
-            seed=RND_SEED, shuffle=False,  # The shuffle is done by train_test_split function!
-            **evenize)
-
-        logger.info("Extracting  %6d elements" % len(selected_index))
-        pick_count = pick_count[selected_index]
-        data_det = data_det[selected_index]
-        labels_det = labels_det[selected_index]
-        labels_loc = labels_loc[selected_index]
-        reals = reals[selected_index]
-        sources_xyz = sources_xyz[selected_index]
-        logger.info("DONE")
-
-    if how_many and isinstance(how_many, int):
-        logger.info("Selecting the first %5d samples" % how_many)
-        data_det = data_det[:how_many]
-        labels_det = labels_det[:how_many]
-        labels_loc = labels_loc[:how_many]
-        reals = reals[:how_many]
-        sources_xyz = sources_xyz[:how_many]
-        reals = reals[:how_many]
-        sources_xyz = sources_xyz[:how_many]
-
-    data_loc = labels_det[:, :, :1, :]  # keep only the first channel for training
-    (label1, label2, label3) = __unpack_data_LOCATOR__(labels_loc)
-    label1 = label1.astype(np.float32)
-    label2 = label2.astype(np.float32)
-    label3 = label3.astype(np.float32)
-
-    logger.info("... Doing _ALL_")
-    (train_data_loader_ALL, test_data_loader_ALL, val_data_loader_ALL) = (
-                                __prepare_data_ALL__(
-                                        data_det, labels_det,
-                                        data_loc, label1, label2, label3,
-                                        reals, sources_xyz,
-                                        heim_gnn, batch_size=BATCH_SIZE,
-                                        adding_path=adding_path))
-
-    return (train_data_loader_ALL, test_data_loader_ALL, val_data_loader_ALL)
-
+    train_loader = DataLoader(ds_train,
+                              batch_size=batch_size,
+                              shuffle=True,
+                              num_workers=confs.DATASET.n_work,
+                              pin_memory=True,
+                              persistent_workers=True,
+                              #
+                              prefetch_factor=confs.DATASET.n_work)
+    test_loader  = DataLoader(ds_test,
+                              batch_size=batch_size,
+                              shuffle=False,
+                              num_workers=confs.DATASET.n_work,
+                              pin_memory=True,
+                              persistent_workers=True,
+                              #
+                              prefetch_factor=confs.DATASET.n_work)
+    val_loader   = DataLoader(ds_val,
+                              batch_size=batch_size,
+                              shuffle=False,
+                              num_workers=confs.DATASET.n_work,
+                              pin_memory=True,
+                              persistent_workers=True,
+                              #
+                              prefetch_factor=confs.DATASET.n_work)
+    return train_loader, test_loader, val_loader
 
 # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
@@ -942,8 +818,8 @@ def pdfs_to_coords_argmax(xy, xz, yz):
     return coords_norm
 
 
-def __training_flow_ALL__(train_loader_ALL, test_loader_ALL, model, gnn, optimizer,
-                          out_save_path="HeimdallModel_LOCATOR_refined.pt"):
+def __training_flow_ALL__(train_loader_ALL, test_loader_ALL, model, gnn,
+                          optimizer, confs, out_save_path="HeimdallModel_LOCATOR_refined.pt"):
     """
     Fine-tune the Heimdall model on the provided training and test data loaders.
 
@@ -985,8 +861,9 @@ def __training_flow_ALL__(train_loader_ALL, test_loader_ALL, model, gnn, optimiz
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                             optimizer, mode='min', factor=0.1,
                             patience=3, threshold=0.001, verbose=True)
-    if not NUM_EPOCHS or NUM_EPOCHS == 0:
-        early_stopping = EarlyStopping(patience=ES_PATIENCE_ALL, delta=ES_DELTA_ALL,
+    if not confs.OPTIMISATION.epochs or confs.OPTIMISATION.epochs == 0:
+        early_stopping = EarlyStopping(patience=confs.OPTIMISATION.early_stopping.patience,
+                                       delta=confs.OPTIMISATION.early_stopping.delta,
                                        verbose=True)
 
     augmentin = Augmentations()
@@ -1015,7 +892,8 @@ def __training_flow_ALL__(train_loader_ALL, test_loader_ALL, model, gnn, optimiz
     LOC_test_loss_yz_history = []
 
     print_sizes = True
-    for epoch in range(NUM_EPOCHS if NUM_EPOCHS else 9999):
+    for epoch in range(confs.OPTIMISATION.epochs
+                       if confs.OPTIMISATION.epochs else 9999):
 
         # ============================>   TRAINING
         model.train()
@@ -1043,7 +921,7 @@ def __training_flow_ALL__(train_loader_ALL, test_loader_ALL, model, gnn, optimiz
                 coord_targets = pdfs_to_coords_argmax(
                                     loc_target1, loc_target2, loc_target3)
 
-            if DO_AUGMENTATIONS:
+            if confs.AUGMENTATION.enabled:
                 # If only 2
                 det_inputs_aug = augmentin.augment_time_series(det_inputs)
                 det_inputs = torch.cat([det_inputs, det_inputs_aug], dim=0)
@@ -1088,9 +966,9 @@ def __training_flow_ALL__(train_loader_ALL, test_loader_ALL, model, gnn, optimiz
             loss_xy = criterion(location_xy, loc_target1)
             loss_xz = criterion(location_xz, loc_target2)
             loss_yz = criterion(location_yz, loc_target3)
-            loc_loss_weighted = (W1_XY * loss_xy +
-                                 W2_XZ * loss_xz +
-                                 W3_YZ * loss_yz)
+            loc_loss_weighted = (confs.LOCATOR_LOSS.xy * loss_xy +
+                                 confs.LOCATOR_LOSS.xz  * loss_xz +
+                                 confs.LOCATOR_LOSS.yz  * loss_yz)
 
             LOC_running_train_loss += loc_loss_weighted.item()
             LOC_running_train_loss_xy += loss_xy.item()
@@ -1103,7 +981,9 @@ def __training_flow_ALL__(train_loader_ALL, test_loader_ALL, model, gnn, optimiz
             # ================================== COMPILE LOSS (new coords)
             # coordinate constraint
             loss_coord = F.smooth_l1_loss(coords, coord_targets)   # or MSE / Huber
-            heim_loss = ALPHA*det_loss + BETA*(loc_loss_weighted/3) + GAMMA*loss_coord
+            heim_loss = (confs.COMPOSITE_LOSS.alpha*det_loss +
+                         confs.COMPOSITE_LOSS.beta*(loc_loss_weighted/3) +
+                         confs.COMPOSITE_LOSS.gamma*loss_coord)
 
             # ================================== Backpropagation and optimization
             HEIM_running_train_loss += heim_loss.item()
@@ -1172,9 +1052,9 @@ def __training_flow_ALL__(train_loader_ALL, test_loader_ALL, model, gnn, optimiz
                 loss_xy = criterion(location_xy, loc_target1)
                 loss_xz = criterion(location_xz, loc_target2)
                 loss_yz = criterion(location_yz, loc_target3)
-                loc_loss_weighted = (W1_XY * loss_xy +
-                                     W2_XZ * loss_xz +
-                                     W3_YZ * loss_yz)
+                loc_loss_weighted = (confs.LOCATOR_LOSS.xy * loss_xy +
+                                     confs.LOCATOR_LOSS.xz * loss_xz +
+                                     confs.LOCATOR_LOSS.yz * loss_yz)
 
                 LOC_running_test_loss += loc_loss_weighted.item()
                 LOC_running_test_loss_xy += loss_xy.item()
@@ -1187,7 +1067,9 @@ def __training_flow_ALL__(train_loader_ALL, test_loader_ALL, model, gnn, optimiz
                 # ================================== COMPILE LOSS (new coords)
                 # coordinate constraint
                 loss_coord = F.smooth_l1_loss(coords, coord_targets)   # or MSE / Huber
-                heim_loss = ALPHA*det_loss + BETA*(loc_loss_weighted/3) + GAMMA*loss_coord
+                heim_loss = (confs.COMPOSITE_LOSS.alpha*det_loss +
+                             confs.COMPOSITE_LOSS.beta*(loc_loss_weighted/3) +
+                             confs.COMPOSITE_LOSS.gamma*loss_coord)
                 #
                 HEIM_running_test_loss += heim_loss.item()
                 torch.cuda.empty_cache()
@@ -1245,7 +1127,7 @@ def __training_flow_ALL__(train_loader_ALL, test_loader_ALL, model, gnn, optimiz
 
         # ============================= >>> PRINTS
         logger.info(
-            f"Epoch {epoch}/{NUM_EPOCHS}, "
+            f"Epoch {epoch}/{confs.OPTIMISATION.epochs}, "
             f"HEIM TRAIN Loss: {HEIM_train_loss:.5f} "
             f"HEIM TEST Loss: {HEIM_test_loss:.5f}")
         logger.info(
@@ -1264,14 +1146,14 @@ def __training_flow_ALL__(train_loader_ALL, test_loader_ALL, model, gnn, optimiz
 
         # ============================= >>> SCHEDULER + EARLY STOPPING
         scheduler.step(HEIM_test_loss)
-        if not NUM_EPOCHS:
+        if not confs.OPTIMISATION.epochs:
             early_stopping(HEIM_test_loss, model, epoch)
             if early_stopping.early_stop:
                 logger.state(f"Early stopping triggered at epoch {epoch}")
                 FINAL_TRAIN_EPOCH = early_stopping.restore_best(model)
                 break
         else:
-            FINAL_TRAIN_EPOCH = NUM_EPOCHS
+            FINAL_TRAIN_EPOCH = confs.OPTIMISATION.epochs
 
     # Save the trained model weights
     logger.info("Storing model in:  %s  After  %d  epochs" % (
@@ -1300,7 +1182,7 @@ def __training_flow_ALL__(train_loader_ALL, test_loader_ALL, model, gnn, optimiz
             FINAL_TRAIN_EPOCH)
 
 
-def training_flow(train_load_ALL, test_load_ALL, Model, heim_gnn, optimizer):
+def training_flow(train_load_ALL, test_load_ALL, Model, heim_gnn, optimizer, confs):
     """
     Wrapper function to run fine-tuning of the Heimdall model and store training metrics.
 
@@ -1314,14 +1196,13 @@ def training_flow(train_load_ALL, test_load_ALL, Model, heim_gnn, optimizer):
         Classifier (torch.nn.Module): Unused classifier instance (ignored).
         heim_gnn (dict): Graph data and related metadata.
         optimizer (torch.optim.Optimizer): Optimizer for training.
+        confs (AttributeDict): configuration dictionary containing the training parameter
 
     Returns:
         tuple: Tuple containing:
             - Model_ref (torch.nn.Module): Fine-tuned Heimdall model.
             - Classifier (torch.nn.Module): Unchanged classifier instance.
     """
-    logger.state("Fine-Tuning ALL")
-
     (Model_ref,
      HEIM_train_loss_history,
      HEIM_test_loss_history,
@@ -1342,7 +1223,7 @@ def training_flow(train_load_ALL, test_load_ALL, Model, heim_gnn, optimizer):
      LOC_test_loss_yz_history, final_train_epoch) = (
         __training_flow_ALL__(
                     train_load_ALL, test_load_ALL, Model,
-                    heim_gnn, optimizer, out_save_path="HEIMDALL.refined.pt"))
+                    heim_gnn, optimizer, confs, out_save_path="HEIMDALL.refined.pt"))
 
     # Save all metrics to an .npz file
     np.savez('refining_training_metrics.npz',
@@ -1364,13 +1245,16 @@ def training_flow(train_load_ALL, test_load_ALL, Model, heim_gnn, optimizer):
              test_loss_history_xz_loc=LOC_test_loss_xz_history,
              test_loss_history_yz_loc=LOC_test_loss_yz_history,
              #
-             batch_size=BATCH_SIZE_ALL,  # the effective one, with or without augmentation
-             rnd_seed=RND_SEED,
+             batch_size=confs.DATASET.batch_size,  # the effective one, with or without augmentation
+             rnd_seed=confs.RANDOM_SEED,
              #
-             learning_rate=LEARNING_RATE,
+             learning_rate=confs.OPTIMISATION.learning_rate,
              epochs=final_train_epoch,
-             early_stop_patience=ES_PATIENCE_ALL if not NUM_EPOCHS else None,
-             early_stop_delta=ES_DELTA_ALL if not NUM_EPOCHS else None)
+             early_stop_patience=(confs.OPTIMISATION.early_stopping.patience
+                                  if not confs.OPTIMISATION.epochs else None),
+             early_stop_delta=(confs.OPTIMISATION.early_stopping.delta
+                               if not confs.OPTIMISATION.epochs else None)
+    )
     return Model_ref
 
 
@@ -1389,9 +1273,7 @@ def unflatten_BN(tensor, B, N):
     return tensor.view(B, N, *tensor.shape[1:])
 
 
-def validate_flow(model, classifier, val_load_ALL,
-                  heim_gnn, heim_locator,
-                  make_figures=True, every=5):
+def validate_flow(model, val_load_ALL, heim_gnn, heim_locator, confs):
     """
     Run validation loop on provided data loader, evaluating detection
     and location performance, computing losses, confusion statistics,
@@ -1399,16 +1281,17 @@ def validate_flow(model, classifier, val_load_ALL,
 
     Args:
         model: The main HEIMDALL model.
-        classifier: Classifier module operating on location outputs.
         val_load_ALL: Validation data loader.
         heim_gnn: Dictionary containing graph and station information.
         heim_locator: Locator module with grid information and conversion utilities.
-        make_figures (bool): Whether to generate plots during validation.
-        every (int): Frequency (in batches) for generating plots.
+        confs (dict): Attribute dict configuration file with TRAINING_PARAMETERS
 
     Returns:
         bool: True if validation completed successfully.
     """
+    make_figures = confs.PLOTS.make_plots
+    every = confs.PLOTS.every_batches
+
     model.eval()
     criterion = nn.BCELoss()
     HEIM_running_val_loss = 0.0
@@ -1458,9 +1341,9 @@ def validate_flow(model, classifier, val_load_ALL,
             loss_xy = criterion(location_xy, loc_target1)
             loss_xz = criterion(location_xz, loc_target2)
             loss_yz = criterion(location_yz, loc_target3)
-            loc_loss_weighted = (W1_XY * loss_xy +
-                                 W2_XZ * loss_xz +
-                                 W3_YZ * loss_yz)
+            loc_loss_weighted = (confs.LOCATOR_LOSS.xy * loss_xy +
+                                 confs.LOCATOR_LOSS.xz * loss_xz +
+                                 confs.LOCATOR_LOSS.yz * loss_yz)
 
             LOC_running_val_loss += loc_loss_weighted.item()
             LOC_running_val_loss_xy += loss_xy.item()
@@ -1473,7 +1356,9 @@ def validate_flow(model, classifier, val_load_ALL,
             # ================================== COMPILE LOSS (new coords)
             # coordinate constraint
             loss_coord = F.smooth_l1_loss(coords, coord_targets)   # or MSE / Huber
-            heim_loss = ALPHA*det_loss + BETA*(loc_loss_weighted/3) + GAMMA*loss_coord
+            heim_loss = (confs.COMPOSITE_LOSS.alpha*det_loss +
+                         confs.COMPOSITE_LOSS.beta*(loc_loss_weighted/3) +
+                         confs.COMPOSITE_LOSS.gamma*loss_coord)
 
             HEIM_running_val_loss += heim_loss.item()
             torch.cuda.empty_cache()
@@ -1718,8 +1603,7 @@ class EarlyStopping:
         return self.best_model_epoch
 
 
-def main(heim_gnn_path, heim_grid_path, config_path,
-         file_path_train, file_path_train_additional=""):
+def main(heim_gnn_path, heim_grid_path, config_path, file_path_train):
     startt = time.time()
     logger.info("HEIMDALL starting ...")
 
@@ -1738,8 +1622,6 @@ def main(heim_gnn_path, heim_grid_path, config_path,
     logger.state("Loading CONFIG:  %s" % config_path)
     CONFIG = gio.read_configuration_file(config_path, check_version=True)
     TP = CONFIG.TRAINING_PARAMETERS          # AttributeDict level
-    logger.state("... setting globals")
-    _ = apply_training_parameters(TP)
 
     # ---------- 1. Initialize  LOCATOR
     HG = glctr.HeimdallLocator(heim_grid['boundaries'],
@@ -1753,27 +1635,20 @@ def main(heim_gnn_path, heim_grid_path, config_path,
 
     # ---------- 1a. Initialize  MODEL
     logger.info(" Initializing MODELS")
-    (Heimdall, optimizer) = __init_model__(SHAPES,
-                                           stats_coords_norm,
-                                           weights=MODEL_WEIGHTS)
+    (Heimdall, optimizer) = __init_model__(SHAPES, stats_coords_norm, TP)
 
-    # ---------- Read Training Data --> March2025
+    # ---------- Read Training Data --> July2025
     # We now have saved with everything to save time n an unique NPZ
-    logger.info("Loading ALL npz")
-    npz_all = np.load(file_path_train, allow_pickle=True)
-    logger.info("Splitting FINETUNING dataset")
-    (train_load, test_load, val_load) = prepare_ALL(npz_all,
-                                                    heim_gnn,
-                                                    how_many=HOWMANY,
-                                                    evenize=EVENIZE_ALL,
-                                                    adding_path=file_path_train_additional)
 
-    logger.info("Starting FINETUNING")
+    logger.info("Preparing HDF5 loaders")
+    (train_load, test_load, val_load) = prepare_h5_loaders(
+                                            file_path_train, heim_gnn, TP)
+
+    logger.state(" T R A I N I N G   S T A R T S   !!!")
     Heimdall_ref = training_flow(
-                train_load, test_load, Heimdall, heim_gnn, optimizer)
+                train_load, test_load, Heimdall, heim_gnn, optimizer, TP)
 
-    validate_flow(Heimdall_ref, val_load, heim_gnn, HG,
-                  make_figures=MAKE_PLOTS, every=EVERY)
+    validate_flow(Heimdall_ref, val_load, heim_gnn, HG, TP)
 
     endt = time.time()
     logger.info("DONE!  Running Time:  %.2f hr." % ((endt-startt)/3600.0))
@@ -1871,16 +1746,36 @@ def normalise_station_coords(coord_mat,
     return coords
 
 
-if __name__ == "__main__":
-    if not (5 <= len(sys.argv) <= 6):
-        logger.error(
-            "%s  GNN.npz  GRID.npz  CONFIG.yml  TRAIN.npz  [ADDTRAIN.npz]",
-            Path(sys.argv[0]).name,
-        )
-        sys.exit()
+def _parse_cli():
+    parser = argparse.ArgumentParser(
+        prog=Path(sys.argv[0]).name,
+        description="Train HEIMDALL with a single HDF5 set.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("-g", "--graph", metavar="GRAPH", type=str, dest="gnn",
+                        required=True, help="Heimdall GNN graph file (.npz)")
+    parser.add_argument("-grd", "--grid", metavar="GRID", type=str, dest="grid",
+                        required=True, help="pre-built grid (npz) (default: %(default)s)")
+    parser.add_argument("-f", "--file", metavar="H5TRAIN", type=str, dest="h5train",
+                        required=True, help="*.h5 with the training data")
+    parser.add_argument("-c", "--conf", dest="config", metavar="YAML", type=str,
+                        required=True, help="Configuration YAML file")
+    return parser
 
-    # Pass the optional argument only if provided
-    if len(sys.argv) == 5:                       # no ADDTRAIN given
-        main(*sys.argv[1:5])                     # 4 params
-    else:                                        # ADDTRAIN present
-        main(*sys.argv[1:6])                     # 5 params
+if __name__ == "__main__":
+
+    p = _parse_cli()
+    args = p.parse_args()
+    # confs = args.TRAINING_PARAMETERS
+    #
+    args.gnn = str(Path(args.gnn).expanduser().resolve())
+    args.grid = str(Path(args.grid).expanduser().resolve())
+    args.config = str(Path(args.config).expanduser().resolve())
+    args.h5train = str(Path(args.h5train).expanduser().resolve())
+    #
+    logger.state("Inputs:")
+    logger.state(f"    gnn: {args.gnn}")
+    logger.state(f"    grid: {args.grid}")
+    logger.state(f"    config: {args.config}")
+    logger.state(f"    h5train: {args.h5train}")
+    main(args.gnn, args.grid, args.config, args.h5train)
+
